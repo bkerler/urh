@@ -1,23 +1,22 @@
 import copy
 import xml.etree.ElementTree as ET
-from xml.dom import minidom
 from collections import defaultdict
+from xml.dom import minidom
 
+import array
 import numpy as np
+import sys
 from PyQt5.QtCore import QObject, pyqtSignal, Qt
 
 from urh import constants
 from urh.awre.FormatFinder import FormatFinder
-from urh.cythonext import signalFunctions
-from urh.cythonext.signalFunctions import Symbol
-
+from urh.cythonext import signalFunctions, util
+from urh.signalprocessing.Message import Message
 from urh.signalprocessing.MessageType import MessageType
 from urh.signalprocessing.Modulator import Modulator
 from urh.signalprocessing.Participant import Participant
-from urh.signalprocessing.Message import Message
 from urh.signalprocessing.Signal import Signal
-from urh.signalprocessing.encoder import Encoder
-from urh.cythonext import util
+from urh.signalprocessing.Encoding import Encoding
 from urh.util.Logger import logger
 
 
@@ -27,6 +26,9 @@ class ProtocolAnalyzerSignals(QObject):
     data_sniffed = pyqtSignal(int)
     sniff_device_errors_changed = pyqtSignal(str)
     line_duplicated = pyqtSignal()
+    fuzzing_started = pyqtSignal(int)
+    current_fuzzing_message_changed = pyqtSignal(int)
+    fuzzing_finished = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -40,12 +42,7 @@ class ProtocolAnalyzer(object):
     """
 
     def __init__(self, signal: Signal):
-        self.messages = []
-        """:type: list of Message """
-
-        self.used_symbols = set()
-        """:type: set of Symbol """
-
+        self.messages = []  # type: list[Message]
         self.signal = signal
         self.filename = self.signal.filename if self.signal is not None else ""
 
@@ -54,7 +51,7 @@ class ProtocolAnalyzer(object):
         self.show = Qt.Checked  # Show in Compare Frame?
         self.qt_signals = ProtocolAnalyzerSignals()
 
-        self.decoder = Encoder(["Non Return To Zero (NRZ)"])  # For Default Encoding of Protocol
+        self.decoder = Encoding(["Non Return To Zero (NRZ)"])  # For Default Encoding of Protocol
 
         self.message_types = [MessageType("default")]
 
@@ -202,7 +199,7 @@ class ProtocolAnalyzer(object):
 
         return "<br>".join(result)
 
-    def set_decoder_for_messages(self, decoder: Encoder, messages=None):
+    def set_decoder_for_messages(self, decoder: Encoding, messages=None):
         messages = messages if messages is not None else self.messages
         self.decoder = decoder
         for message in messages:
@@ -221,21 +218,27 @@ class ProtocolAnalyzer(object):
 
         bit_len = signal.bit_len
 
-        rel_symbol_len = self._read_symbol_len()
-        self.used_symbols.clear()
+        try:
+            ppseq = signalFunctions.grab_pulse_lens(signal.qad, signal.qad_center, signal.tolerance,
+                                                    signal.modulation_type, signal.bit_len)
+        except TypeError:
+            # Remove this check in version 1.7
+            print("Extension method has changed! To fix this, first move to URHs base directory "
+                  "then recompile the extensions using the following command:")
+            print("python3 src/urh/cythonext/build.py")
+            print("and finally restart the application")
+            sys.exit(1)
 
-        ppseq = signalFunctions.grab_pulse_lens(signal.qad,
-                                                signal.qad_center,
-                                                signal.tolerance,
-                                                signal.modulation_type)
-
-        bit_data, pauses, bit_sample_pos = self._ppseq_to_bits(ppseq, bit_len, rel_symbol_len)
+        bit_data, pauses, bit_sample_pos = self._ppseq_to_bits(ppseq, bit_len, pause_threshold=signal.pause_threshold)
+        if signal.message_length_divisor > 1 and signal.modulation_type_str == "ASK":
+            self.__ensure_message_length_multiple(bit_data, signal.bit_len, pauses, bit_sample_pos,
+                                                  signal.message_length_divisor)
 
         i = 0
         for bits, pause in zip(bit_data, pauses):
             middle_bit_pos = bit_sample_pos[i][int(len(bits) / 2)]
             start, end = middle_bit_pos, middle_bit_pos + bit_len
-            rssi = np.mean(np.abs(signal._fulldata[start:end]))
+            rssi = np.mean(np.abs(signal.data[start:end]))
             message = Message(bits, pause, message_type=self.default_message_type,
                               bit_len=bit_len, rssi=rssi, decoder=self.decoder, bit_sample_pos=bit_sample_pos[i])
             self.messages.append(message)
@@ -243,22 +246,39 @@ class ProtocolAnalyzer(object):
 
         self.qt_signals.protocol_updated.emit()
 
-    def _read_symbol_len(self):
-        settings = constants.SETTINGS
-        if 'rel_symbol_length' in settings.allKeys():
-            rel_symbol_len = settings.value('rel_symbol_length', type=int) / 200
-        else:
-            rel_symbol_len = 0.1
-        return rel_symbol_len
+    @staticmethod
+    def __ensure_message_length_multiple(bit_data, bit_len: int, pauses, bit_sample_pos, divisor: int):
+        """
+        In case of ASK modulation, this method tries to use pauses after messages as zero bits so that
+        the bit lengths of messages are divisible by divisor
+        :param bit_data: List of bit arrays
+        :param bit_len: Bit length that was used for demodulation
+        :param pauses: List of pauses
+        :param bit_sample_pos: List of Array of bit sample positions
+        :param divisor: Divisor the messages should be divisible by
+        """
+        for i in range(len(bit_data)):
+            missing_bits = (divisor - (len(bit_data[i]) % divisor)) % divisor
+            if missing_bits > 0 and pauses[i] >= bit_len * missing_bits:
+                bit_data[i].extend([0] * missing_bits)
+                pauses[i] = pauses[i] - missing_bits * bit_len
 
-    def _ppseq_to_bits(self, ppseq, bit_len: int, rel_symbol_len: float, write_bit_sample_pos=True):
-        self.used_symbols.clear()
-        bit_sampl_pos = []
+                try:
+                    bit_sample_pos[i][-1] = bit_sample_pos[i][-2] + bit_len
+                except IndexError as e:
+                    logger.warning("Error padding message " + str(e))
+                    continue
+
+                bit_sample_pos[i].extend([bit_sample_pos[i][-1] + (k + 1) * bit_len for k in range(missing_bits - 1)])
+                bit_sample_pos[i].append(bit_sample_pos[i][-1] + pauses[i])
+
+    def _ppseq_to_bits(self, ppseq, bit_len: int, write_bit_sample_pos=True, pause_threshold=8):
+        bit_sampl_pos = array.array("L", [])
         bit_sample_positions = []
 
-        data_bits = []
+        data_bits = array.array("B", [])
         resulting_data_bits = []
-        pauses = []
+        pauses = array.array("L", [])
         start = 0
         total_samples = 0
 
@@ -267,9 +287,6 @@ class ProtocolAnalyzer(object):
         one_pulse_type = 1
 
         there_was_data = False
-        lower_bit_bound = 0.5 - rel_symbol_len
-        upper_bit_bound = 0.5 + rel_symbol_len
-        avail_symbol_names = constants.SYMBOL_NAMES
 
         if len(ppseq) > 0 and ppseq[0, 0] == pause_type:
             start = 1  # Starts with Pause
@@ -282,49 +299,31 @@ class ProtocolAnalyzer(object):
             num_bits = int(num_bits_floated)
             decimal_place = num_bits_floated - num_bits
 
-            if decimal_place > upper_bit_bound:
+            if decimal_place > 0.5:
                 num_bits += 1
-            elif lower_bit_bound < decimal_place < upper_bit_bound and \
-                    (not cur_pulse_type == pause_type or num_bits < 9):
-                ptype = 1 if cur_pulse_type == one_pulse_type else 0
-                if not there_was_data:
-                    there_was_data = bool(ptype)
-
-                symbol = self.__find_matching_symbol(num_bits, ptype)
-                if symbol is None:
-                    symbol = self.__create_symbol(num_bits, ptype,
-                                                  num_samples,
-                                                  avail_symbol_names)
-
-                data_bits.append(symbol)
-                if write_bit_sample_pos:
-                    bit_sampl_pos.append(total_samples)
-
-                total_samples += num_samples
-                continue
 
             if cur_pulse_type == pause_type:
-                # OOK abdecken
-                if num_bits < 9:
+                # OOK
+                if num_bits <= pause_threshold or pause_threshold == 0:
                     data_bits.extend([False] * num_bits)
                     if write_bit_sample_pos:
                         bit_sampl_pos.extend([total_samples + k * bit_len for k in range(num_bits)])
 
                 elif not there_was_data:
-                    # Ignore this pause, if there were no informations
-                    # transmittted previously
-                    data_bits[:] = []
-                    bit_sampl_pos[:] = []
+                    # Ignore this pause, if there were no information
+                    # transmitted previously
+                    data_bits[:] = array.array("B", [])
+                    bit_sampl_pos[:] = array.array("L", [])
 
                 else:
                     if write_bit_sample_pos:
                         bit_sampl_pos.append(total_samples)
                         bit_sampl_pos.append(total_samples + num_samples)
                         bit_sample_positions.append(bit_sampl_pos[:])
-                        bit_sampl_pos[:] = []
+                        bit_sampl_pos[:] = array.array("L", [])
 
                     resulting_data_bits.append(data_bits[:])
-                    data_bits[:] = []
+                    data_bits[:] = array.array("B", [])
                     pauses.append(num_samples)
                     there_was_data = False
 
@@ -345,120 +344,91 @@ class ProtocolAnalyzer(object):
         if there_was_data:
             resulting_data_bits.append(data_bits[:])
             if write_bit_sample_pos:
-                bit_sample_positions.append(bit_sampl_pos[:] + [total_samples])
+                bit_sample_positions.append(bit_sampl_pos[:] + array.array("L", [total_samples]))
             pause = ppseq[-1, 1] if ppseq[-1, 0] == pause_type else 0
             pauses.append(pause)
 
         return resulting_data_bits, pauses, bit_sample_positions
 
-    def __find_matching_symbol(self, num_bits: int, pulsetype: int):
-        for s in self.used_symbols:
-            if s.nbits == num_bits and s.pulsetype == pulsetype:
-                return s
-        return None
-
-    def __create_symbol(self, num_bits, ptype, num_samples, avail_symbol_names):
-        name_index = len(self.used_symbols)
-        if name_index > len(avail_symbol_names) - 1:
-            name_index = len(avail_symbol_names) - 1
-            print(
-                "WARNING:"
-                "Needed more symbols than names were available."
-                "Symbols may be wrong labeled,"
-                "consider extending the symbol alphabet.")
-
-        symbol = Symbol(avail_symbol_names[name_index],
-                        num_bits, ptype, num_samples)
-
-        self.used_symbols.add(symbol)
-        return symbol
-
-    def get_samplepos_of_bitseq(self, startmessage: int, startindex: int,
-                                endmessage: int, endindex: int,
+    def get_samplepos_of_bitseq(self, start_message: int, start_index: int, end_message: int, end_index: int,
                                 include_pause: bool):
         """
         Determine on which place (regarding samples) a bit sequence is
         :rtype: tuple[int,int]
         """
-        lookup = {i: message.bit_sample_pos for i, message in enumerate(self.messages)}
         try:
-            if startmessage > endmessage:
-                startmessage, endmessage = endmessage, startmessage
+            if start_message > end_message:
+                start_message, end_message = end_message, start_message
 
-            if startindex >= len(lookup[startmessage]) - 1:
-                startindex = len(lookup[startmessage]) - 1
+            if start_index >= len(self.messages[start_message].bit_sample_pos) - 1:
+                start_index = len(self.messages[start_message].bit_sample_pos) - 1
                 if not include_pause:
-                    startindex -= 1
+                    start_index -= 1
 
-            if endindex >= len(lookup[endmessage]) - 1:
-                endindex = len(lookup[endmessage]) - 1
+            if end_index >= len(self.messages[end_message].bit_sample_pos) - 1:
+                end_index = len(self.messages[end_message].bit_sample_pos) - 1
                 if not include_pause:
-                    endindex -= 1
+                    end_index -= 1
 
-            start = lookup[startmessage][startindex]
-            end = lookup[endmessage][endindex] - start
+            start = self.messages[start_message].bit_sample_pos[start_index]
+            num_samples = self.messages[end_message].bit_sample_pos[end_index] - start
 
-            return start, end
+            return start, num_samples
         except KeyError:
             return -1, -1
 
-    def get_bitseq_from_selection(self, selection_start: int, selection_width: int, bitlen: int):
+    def get_bitseq_from_selection(self, selection_start: int, selection_width: int):
         """
-        Holt Start und Endindex der Bitsequenz von der Selektion der Samples
+        get start and end index of bit sequence from selected samples
 
-        :param selection_start: Selektionsstart in Samples
-        :param selection_width: Selektionsende in Samples
         :rtype: tuple[int,int,int,int]
-        :return: Startmessage, Startindex, Endmessage, Endindex
+        :return: start_message index, start index, end message index, end index
         """
-        start_message = -1
-        start_index = -1
-        end_message = -1
-        end_index = -1
-        lookup = [msg.bit_sample_pos for msg in self.messages]
-        if not lookup:
-            return -1, -1, -1, -1
-
-        if selection_start + selection_width < lookup[0][0] or selection_width < bitlen:
+        start_message, start_index, end_message, end_index = -1, -1, -1, -1
+        if not self.messages or not self.messages[0].bit_sample_pos:
             return start_message, start_index, end_message, end_index
 
-        for j, msg_sample_pos in enumerate(lookup):
+        if selection_start + selection_width < self.messages[0].bit_sample_pos[0]:
+            return start_message, start_index, end_message, end_index
+
+        for i, msg in enumerate(self.messages):
+            msg_sample_pos = msg.bit_sample_pos
             if msg_sample_pos[-2] < selection_start:
                 continue
             elif start_message == -1:
-                start_message = j
-                for i, sample_pos in enumerate(msg_sample_pos):
+                start_message = i
+                for j, sample_pos in enumerate(msg_sample_pos):
                     if sample_pos < selection_start:
                         continue
                     elif start_index == -1:
-                        start_index = i
+                        start_index = j
                         if msg_sample_pos[-1] - selection_start < selection_width:
                             break
                     elif sample_pos - selection_start > selection_width:
-                        end_message = j
-                        end_index = i
-                        return start_message, start_index, end_message, end_index
+                        return start_message, start_index, i, j
             elif msg_sample_pos[-1] - selection_start < selection_width:
                 continue
             else:
-                end_message = j
-                for i, sample_pos in enumerate(msg_sample_pos):
+                for j, sample_pos in enumerate(msg_sample_pos):
                     if sample_pos - selection_start > selection_width:
-                        end_index = i
-                        return start_message, start_index, end_message, end_index
+                        return start_message, start_index, i, j
 
-        last_message = len(lookup) - 1
-        last_index = len(lookup[last_message]) - 1
+        last_message = len(self.messages) - 1
+        last_index = len(self.messages[-1].plain_bits) + 1
         return start_message, start_index, last_message, last_index
 
-    def delete_messages(self, msg_start: int, msg_end: int, start: int, end: int, view: int, decoded: bool):
+    def delete_messages(self, msg_start: int, msg_end: int, start: int, end: int, view: int, decoded: bool,
+                        update_label_ranges=True):
         removable_msg_indices = []
 
         for i in range(msg_start, msg_end + 1):
             try:
-                self.messages[i].clear_decoded_bits()
                 bs, be = self.convert_range(start, end, view, 0, decoded, message_indx=i)
-                del self.messages[i][bs:be + 1]
+                self.messages[i].clear_decoded_bits()
+                if update_label_ranges:
+                    del self.messages[i][bs:be + 1]
+                else:
+                    self.messages[i].delete_range_without_label_range_update(bs, be + 1)
                 if len(self.messages[i]) == 0:
                     removable_msg_indices.append(i)
             except IndexError:
@@ -467,6 +437,8 @@ class ProtocolAnalyzer(object):
         # Remove empty messages and Pause after empty message
         for i in reversed(removable_msg_indices):
             del self.messages[i]
+
+        return removable_msg_indices
 
     def convert_index(self, index: int, from_view: int, to_view: int, decoded: bool, message_indx=-1) -> tuple:
         """
@@ -573,17 +545,17 @@ class ProtocolAnalyzer(object):
             return 0
 
         assert self.signal is not None
-        freqs = []
+        frequencies = []
         for i, message in enumerate(self.messages):
             for j, msg_bit in enumerate(message.plain_bits):
                 if msg_bit == bit:
-                    start, nsamples = self.get_samplepos_of_bitseq(i, j, i, j + 1, False)
-                    freq = self.signal.estimate_frequency(start, start + nsamples, sample_rate)
-                    freqs.append(freq)
-                    if len(freqs) == nbits:
-                        return np.mean(freqs)
-        if freqs:
-            return np.mean(freqs)
+                    start, num_samples = self.get_samplepos_of_bitseq(i, j, i, j + 1, False)
+                    freq = self.signal.estimate_frequency(start, start + num_samples, sample_rate)
+                    frequencies.append(freq)
+                    if len(frequencies) == nbits:
+                        return np.mean(frequencies)
+        if frequencies:
+            return np.mean(frequencies)
         else:
             return 0
 
@@ -605,8 +577,20 @@ class ProtocolAnalyzer(object):
                 break
 
     def to_xml_tag(self, decodings, participants, tag_name="protocol", include_message_type=False,
-                   write_bits=False) -> ET.Element:
+                   write_bits=False, messages=None) -> ET.Element:
+        """
+
+        :param decodings:
+        :param participants:
+        :param tag_name:
+        :param include_message_type:
+        :param write_bits:
+        :param messages: Give custom list of messages to use instead of self.messages. Used when saving project and
+        some subprotocols are hidden in Compare Frame Controller
+        :return:
+        """
         root = ET.Element(tag_name)
+        messages = self.messages if messages is None else messages
 
         # Save modulators
         if hasattr(self, "modulators"):  # For protocol analyzer container
@@ -614,18 +598,10 @@ class ProtocolAnalyzer(object):
             for i, modulator in enumerate(self.modulators):
                 modulators_tag.append(modulator.to_xml(i))
 
-        # Save symbols
-        if len(self.used_symbols) > 0:
-            symbols_tag = ET.SubElement(root, "symbols")
-            for symbol in self.used_symbols:
-                ET.SubElement(symbols_tag, "symbol",
-                              attrib={"name": symbol.name, "pulsetype": str(symbol.pulsetype),
-                                      "nbits": str(symbol.nbits), "nsamples": str(symbol.nsamples)})
-
         # Save decodings
         if not decodings:
             decodings = []
-            for message in self.messages:
+            for message in messages:
                 if message.decoder not in decodings:
                     decodings.append(message.decoder)
 
@@ -640,7 +616,7 @@ class ProtocolAnalyzer(object):
         # Save participants
         if not participants:
             participants = []
-            for message in self.messages:
+            for message in messages:
                 if message.participant and message.participant not in participants:
                     participants.append(message.participant)
 
@@ -650,7 +626,7 @@ class ProtocolAnalyzer(object):
 
         # Save data
         data_tag = ET.SubElement(root, "messages")
-        for i, message in enumerate(self.messages):
+        for i, message in enumerate(messages):
             message_tag = message.to_xml(decoders=decodings, include_message_type=include_message_type)
             if write_bits:
                 message_tag.set("bits", message.plain_bits_str)
@@ -686,15 +662,6 @@ class ProtocolAnalyzer(object):
 
         decoders = self.read_decoders_from_xml_tag(root) if decodings is None else decodings
 
-        self.used_symbols.clear()
-        try:
-            for symbol_tag in root.find("symbols").findall("symbol"):
-                s = Symbol(symbol_tag.get("name"), int(symbol_tag.get("nbits")),
-                           int(symbol_tag.get("pulsetype")), int(symbol_tag.get("nsamples")))
-                self.used_symbols.add(s)
-        except AttributeError:
-            pass
-
         if participants is None:
             participants = self.read_participants_from_xml_tag(root)
 
@@ -716,8 +683,7 @@ class ProtocolAnalyzer(object):
             message_tags = root.find("messages").findall("message")
             for i, message_tag in enumerate(message_tags):
                 if read_bits:
-                    message = Message.from_plain_bits_str(bits=message_tag.get("bits"),
-                                                          symbols={s.name: s for s in self.used_symbols})
+                    message = Message.from_plain_bits_str(bits=message_tag.get("bits"))
                     message.from_xml(tag=message_tag, participants=participants, decoders=decoders,
                                      message_types=self.message_types)
                     self.messages.append(message)
@@ -748,7 +714,7 @@ class ProtocolAnalyzer(object):
             decoders = []
             for decoding_tag in root.find("decodings").findall("decoding"):
                 conf = [d.strip().replace("'", "") for d in decoding_tag.text.split(",") if d.strip().replace("'", "")]
-                decoders.append(Encoder(conf))
+                decoders.append(Encoding(conf))
             return decoders
         except AttributeError:
             logger.error("no decodings found in xml")
@@ -767,14 +733,12 @@ class ProtocolAnalyzer(object):
         root = tree.getroot()
         self.from_xml_tag(root, read_bits=read_bits)
 
-    def destroy(self):
-        try:
-            for message_type in self.message_types:
-                message_type.clear()
-        except TypeError:
-            pass  # No message types defined
-        self.message_types = []
+    def eliminate(self):
+        self.message_types = None
         self.messages = None
+        if self.signal is not None:
+            self.signal.eliminate()
+        self.signal = None
 
     def update_auto_message_types(self):
         for message in self.messages:
@@ -819,7 +783,7 @@ class ProtocolAnalyzer(object):
 
     def auto_assign_decodings(self, decodings):
         """
-        :type decodings: list of Encoder
+        :type decodings: list of Encoding
         """
         nrz_decodings = [decoding for decoding in decodings if decoding.is_nrz or decoding.is_nrzi]
         fallback = nrz_decodings[0] if nrz_decodings else None
@@ -839,10 +803,6 @@ class ProtocolAnalyzer(object):
                 message.decoder = fallback
 
     def auto_assign_labels(self):
-        if len(self.used_symbols) > 0:
-            logger.info("Format Finder not compatible with symbols yet.")
-            return
-
         format_finder = FormatFinder(self)
 
         # OPEN: Perform multiple iterations with varying priorities later

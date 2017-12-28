@@ -1,8 +1,11 @@
 import os
 import sys
+import tempfile
 
 if sys.version_info < (3, 4):
     print("You need at least Python 3.4 for this application!")
+    if sys.version_info[0] < 3:
+        print("try running with python3 {}".format(" ".join(sys.argv)))
     sys.exit(1)
 
 try:
@@ -13,16 +16,15 @@ except ImportError:
     print("Try installing them with pip install setuptools")
     sys.exit(1)
 
-from distutils import ccompiler
+from src.urh.dev.native import ExtensionHelper
 import src.urh.version as version
 
 if sys.platform == "win32":
-    OPEN_MP_FLAG = "-openmp"
+    OPEN_MP_FLAG = "/openmp"
 elif sys.platform == "darwin":
     OPEN_MP_FLAG = ""  # no OpenMP support in default Mac OSX compiler
 else:
     OPEN_MP_FLAG = "-fopenmp"
-
 
 COMPILER_DIRECTIVES = {'language_level': 3,
                        'cdivision': True,
@@ -34,6 +36,8 @@ COMPILER_DIRECTIVES = {'language_level': 3,
 UI_SUBDIRS = ("actions", "delegates", "views")
 PLUGINS = [path for path in os.listdir("src/urh/plugins") if os.path.isdir(os.path.join("src/urh/plugins", path))]
 URH_DIR = "urh"
+
+IS_RELEASE = os.path.isfile(os.path.join(tempfile.gettempdir(), "urh_releasing"))
 
 try:
     import Cython.Build
@@ -70,14 +74,21 @@ def get_package_data():
     for plugin in PLUGINS:
         package_data["urh.plugins." + plugin] = ['*.ui', "*.txt"]
 
-    is_release = os.path.isfile("/tmp/urh_releasing")  # make sure precompiled binding are uploaded to PyPi
+    package_data["urh.dev.native.lib"] = ["*.cpp", "*.c", "*.pyx", "*.pxd"]
 
-    package_data["urh.dev.native.lib"] = ["*.cpp", "*.pyx", "*.pxd"]
+    # Bundle headers
+    package_data["urh.dev.native.includes"] = ["*.h"]
+    include_dir = "src/urh/dev/native/includes"
+    for dirpath, dirnames, filenames in os.walk(include_dir):
+        for dir_name in dirnames:
+            rel_dir_path = os.path.relpath(os.path.join(dirpath, dir_name), include_dir)
+            package_data["urh.dev.native.includes."+rel_dir_path.replace(os.sep, ".")] = ["*.h"]
 
-    if sys.platform == "win32" or is_release:
+    if sys.platform == "win32" or IS_RELEASE:
         # we use precompiled device backends on windows
-        package_data["urh.dev.native.lib.win"] = ["*"]
-        package_data["urh.dev.native.lib.win.libhackrf"] = ["*"]
+        # only deploy DLLs on Windows or in release mode to prevent deploying by linux package managers
+        package_data["urh.dev.native.lib.win.x64"] = ["*"]
+        package_data["urh.dev.native.lib.win.x86"] = ["*"]
 
     return package_data
 
@@ -93,72 +104,36 @@ def get_ext_modules():
     return extensions
 
 
-def get_device_modules():
-    if sys.platform == "win32":
-        NATIVES = ["rtlsdr", "hackrf"]
-        result = []
-        include_dir = os.path.realpath(os.path.join(os.curdir, "src/urh/dev/native/lib/win"))
-        lib_dir = os.path.realpath(os.path.join(os.curdir, "src/urh/dev/native/lib/win"))
-        for native in NATIVES:
-            result.append(Extension("urh.dev.native.lib."+native, ["src/urh/dev/native/lib/{}.cpp".format(native)],
-                          libraries=[native],
-                          library_dirs=[lib_dir],
-                          include_dirs=[include_dir],
-                          language="c++"))
-
-
-        return result
-
-    compiler = ccompiler.new_compiler()
-
-    extensions = []
-    devices = {
-        "hackrf": {"lib": "hackrf", "test_function": "hackrf_init"},
-        "rtlsdr": {"lib": "rtlsdr", "test_function": "rtlsdr_get_device_name"}
-    }
-
-    scriptdir = os.path.realpath(os.path.dirname(__file__))
-    sys.path.append(os.path.realpath(os.path.join(scriptdir, "src", "urh", "dev", "native", "lib")))
-    for dev_name, params in devices.items():
-        if compiler.has_function(params["test_function"], libraries=(params["lib"],)):
-            print("\n\n\nFound {0}.h - will compile with native {1} support\n\n\n".format(params["lib"], dev_name))
-            e = Extension("urh.dev.native.lib." + dev_name, ["src/urh/dev/native/lib/{0}{1}".format(dev_name, EXT)],
-                          extra_compile_args=[OPEN_MP_FLAG],
-                          extra_link_args=[OPEN_MP_FLAG], language="c++",
-                          libraries=[params["lib"]])
-            extensions.append(e)
-        else:
-            print("\n\n\nCould not find {0}.h - skipping native support for {1}\n\n\n".format(params["lib"], dev_name))
-        try:
-            os.remove("a.out")  # Temp file for checking
-        except OSError:
-            pass
-    return extensions
-
-
 def read_long_description():
     try:
         import pypandoc
-        return pypandoc.convert('README.md', 'rst')
-    except(IOError, ImportError):
+        with open("README.md") as f:
+            text = f.read()
+
+        # Remove screenshots as they get rendered poorly on PyPi
+        stripped_text = text[:text.index("# Screenshots")].rstrip()
+        return pypandoc.convert_text(stripped_text, 'rst', format='md')
+    except:
         return ""
 
-# import generate_ui
-# generate_ui.gen # pyuic5 is not included in all python3-pyqt5 packages (e.g. ubuntu), therefore do not regenerate UI here
-
-install_requires = ["numpy", "psutil", "zmq"]
-try:
-    import PyQt5
-except ImportError:
+install_requires = ["numpy", "psutil", "pyzmq"]
+if IS_RELEASE:
     install_requires.append("pyqt5")
+else:
+    try:
+        import PyQt5
+    except ImportError:
+        install_requires.append("pyqt5")
 
 if sys.version_info < (3, 4):
     install_requires.append('enum34')
 
-extensions = get_ext_modules() + get_device_modules()
+ExtensionHelper.USE_RELATIVE_PATHS = True
+extensions = get_ext_modules() + ExtensionHelper.get_device_extensions(USE_CYTHON)
 
 if USE_CYTHON:
     from Cython.Build import cythonize
+
     extensions = cythonize(extensions, compiler_directives=COMPILER_DIRECTIVES)
 
 setup(
@@ -171,7 +146,7 @@ setup(
     package_dir={"": "src"},
     package_data=get_package_data(),
     url="https://github.com/jopohl/urh",
-    license="Apache License 2.0",
+    license="GNU General Public License (GPL)",
     download_url="https://github.com/jopohl/urh/tarball/v" + str(version.VERSION),
     install_requires=install_requires,
     setup_requires=['numpy'],

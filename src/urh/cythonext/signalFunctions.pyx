@@ -1,12 +1,16 @@
 # noinspection PyUnresolvedReferences
+cimport numpy as np
+import numpy as np
 from libcpp cimport bool
 
-# noinspection PyUnresolvedReferences
-import numpy as np
-cimport numpy as np
+# As we do not use any numpy C API functions we do no import_array here,
+# because it can lead to OS X error: https://github.com/jopohl/urh/issues/273
+# np.import_array()
+
 from urh.cythonext import util
 
 from cython.parallel import prange
+# noinspection PyUnresolvedReferences
 from libc.math cimport atan2, sqrt, M_PI, sin, cos
 
 cdef:
@@ -75,7 +79,7 @@ cdef void costa_demod(float complex[::1] samples, float[::1] result, float noise
 
 cpdef np.ndarray[np.float32_t, ndim=1] afp_demod(float complex[::1] samples, float noise_mag, int mod_type):
     if len(samples) <= 2:
-        return np.empty(len(samples), dtype=np.float32)
+        return np.zeros(len(samples), dtype=np.float32)
 
     cdef long long i, ns
     cdef float complex tmp = 0
@@ -85,7 +89,7 @@ cpdef np.ndarray[np.float32_t, ndim=1] afp_demod(float complex[::1] samples, flo
     cdef float imag = 0
     ns = len(samples)
 
-    cdef float[::1] result = np.empty(ns, dtype=np.float32, order="C")
+    cdef float[::1] result = np.zeros(ns, dtype=np.float32, order="C")
     cdef float costa_freq = 0
     cdef float costa_phase = 0
     cdef complex nco_out = 0
@@ -191,119 +195,100 @@ cpdef unsigned long long find_signal_end(float[::1] demod_samples, int mod_type)
 
     return ns
 
-cpdef unsigned long long[:, ::1] grab_pulse_lens(float[::1] samples,
-                                                 float treshold, unsigned int tolerance, int mod_type):
+cpdef unsigned long long[:, ::1] grab_pulse_lens(float[::1] samples, float center,
+                                                 unsigned int tolerance, int modulation_type, unsigned int bit_length):
     """
     Holt sich die Pulslängen aus den quadraturdemodulierten Samples
     @param samples: Samples nach der QAD
-    @param treshold: Alles über der Treshold ist ein Einserpuls, alles darunter 0er Puls
+    @param center: Alles über der Treshold ist ein Einserpuls, alles darunter 0er Puls
     @return: Ein 2D Array arr.
     arr[i] gibt Position an.
     arr[i][0] gibt an ob Einspuls (arr[i][0] = 1) Nullpuls (arr[i][0] = 0) Pause (arr[i][0] = 42)
     arr[i][1] gibt die Länge des Pulses bzw. der Pause an.
     """
-    cdef unsigned long long i, ns, pulselen = 0
-    cdef unsigned long long cur_index = 0, conseq_ones = 0, conseq_zeros = 0, conseq_pause = 0
+    cdef int is_ask = modulation_type == 0
+    cdef unsigned long long i, pulse_length = 0
+    cdef unsigned long long cur_index = 0, consecutive_ones = 0, consecutive_zeros = 0, consecutive_pause = 0
     cdef float s, s_prev
-    cdef int cur_state
-    cdef float NOISE = get_noise_for_mod_type(mod_type)
-    ns = len(samples)
+    cdef int cur_state, new_state
+    cdef float NOISE = get_noise_for_mod_type(modulation_type)
+    cdef unsigned long long num_samples = len(samples)
 
-    cdef unsigned long long[:, ::1] result = np.empty((ns, 2), dtype=np.uint64, order="C")
-    if ns == 0:
+    cdef unsigned long long[:, ::1] result = np.zeros((num_samples, 2), dtype=np.uint64, order="C")
+    if num_samples == 0:
         return result
 
     s_prev = samples[0]
     if s_prev == NOISE:
         cur_state = 42
-    elif s_prev > treshold:
+    elif s_prev > center:
         cur_state = 1
     else:
         cur_state = 0
 
-    for i in range(ns-1):
-        pulselen += 1
+    for i in range(num_samples):
+        pulse_length += 1
         s = samples[i]
         if s == NOISE:
-            conseq_pause += 1
-            conseq_ones = 0
-            conseq_zeros = 0
-            if cur_state == 42: continue
-        elif s > treshold:
-            conseq_ones += 1
-            conseq_zeros = 0
-            conseq_pause = 0
-            if cur_state == 1: continue
+            consecutive_pause += 1
+            consecutive_ones = 0
+            consecutive_zeros = 0
+            if cur_state == 42:
+                continue
+
+        elif s > center:
+            consecutive_ones += 1
+            consecutive_zeros = 0
+            consecutive_pause = 0
+            if cur_state == 1:
+                continue
+
         else:
-            conseq_zeros += 1
-            conseq_ones = 0
-            conseq_pause = 0
-            if cur_state == 0: continue
+            consecutive_zeros += 1
+            consecutive_ones = 0
+            consecutive_pause = 0
+            if cur_state == 0:
+                continue
 
-        if conseq_ones > tolerance:
-            result[cur_index, 0] = cur_state
-            result[cur_index, 1] = pulselen - tolerance
-            cur_index += 1
-            pulselen = tolerance
-            cur_state = 1
+        if consecutive_ones > tolerance:
+            new_state = 1
+        elif consecutive_zeros > tolerance:
+            new_state = 0
+        elif consecutive_pause > tolerance:
+            new_state = 42
+        else:
+            continue
 
-        elif conseq_zeros > tolerance:
-            result[cur_index, 0] = cur_state
-            result[cur_index, 1] = pulselen - tolerance
-            cur_index += 1
-            pulselen = tolerance
+        if is_ask and cur_state == 42 and (pulse_length - tolerance) < bit_length:
+            # Aggregate short pauses for ASK
             cur_state = 0
 
-        elif conseq_pause > tolerance:
+        if cur_index > 0 and result[cur_index - 1, 0] == cur_state:
+            result[cur_index - 1, 1] += pulse_length - tolerance
+        else:
             result[cur_index, 0] = cur_state
-            result[cur_index, 1] = pulselen - tolerance
+            result[cur_index, 1] = pulse_length - tolerance
             cur_index += 1
-            pulselen = tolerance
-            cur_state = 42
 
-    # Letzen anfügen
+        pulse_length = tolerance
+        cur_state = new_state
+
+    # Append last one
     cdef unsigned long long len_result = len(result)
     if cur_index < len_result:
-        result[cur_index, 0] = cur_state
-        result[cur_index, 1] = pulselen
-        cur_index += 1
-
-    if cur_index > len_result:
-        cur_index = len_result
+        if cur_index > 0 and result[cur_index - 1, 0] == cur_state:
+            result[cur_index - 1, 1] += pulse_length - tolerance
+        else:
+            result[cur_index, 0] = cur_state
+            result[cur_index, 1] = pulse_length - tolerance
+            cur_index += 1
 
     return result[:cur_index]
-
-cdef class Symbol:
-    cdef public str name
-    cdef public int nbits
-    cdef public int pulsetype
-    cdef public unsigned long long nsamples # Num Samples for this Symbol. Needed in Modulator.
-    def __init__(self, str name, int nbits, int pulsetype, unsigned long long nsamples):
-        """
-        :param nbits: Number of bits this Symbol covers
-        :param name: Name of the symbol (one char)
-        :param pulsetype: 0 für 0er Puls, 1 für 1er Puls
-        :return:
-        """
-        self.name = name
-        self.pulsetype = pulsetype
-        self.nbits = nbits
-        self.nsamples = nsamples
-
-    def __repr__(self):
-        return "{0} ({1}:{2})".format(self.name, self.pulsetype, self.name)
-
-    def __deepcopy__(self, memo):
-        result = Symbol(self.name, self.nbits, self.pulsetype, self.nsamples)
-        memo[id(self)] = result
-        return result
-
-
 
 cpdef unsigned long long estimate_bit_len(float[::1] qad_samples, float qad_center, int tolerance, int mod_type):
 
     start = find_signal_start(qad_samples, mod_type)
-    cdef unsigned long long[:, ::1] ppseq = grab_pulse_lens(qad_samples[start:], qad_center, tolerance, mod_type)
+    cdef unsigned long long[:, ::1] ppseq = grab_pulse_lens(qad_samples[start:], qad_center, tolerance, mod_type, 0)
     cdef unsigned long long i = 0
     cdef unsigned long long l = len(ppseq)
     for i in range(0, l):
@@ -376,20 +361,52 @@ cpdef float estimate_qad_center(float[::1] samples, unsigned int num_centers):
         clusters[center_index].nitems += 1
 
     cdef unsigned long long[::1] cluster_lens = np.array([clusters[i].nitems for i in range(num_centers)], dtype=np.uint64)
-    cdef np.ndarray[np.int64_t, ndim=1] sorted_indexes = np.argsort(cluster_lens)
+    # can't to static typing here, because resulting type of argsort depends on x64/x86
+    sorted_indexes = np.argsort(cluster_lens)
     cdef float center1, center2
     cdef int index1 = sorted_indexes[len(sorted_indexes)-1]
     cdef int index2 = sorted_indexes[len(sorted_indexes)-2]
 
     if clusters[index1].nitems > 0:
-        center1 = clusters[index1].sum / clusters[index1].nitems # Cluster mit den meisten Einträgen
+        center1 = clusters[index1].sum / clusters[index1].nitems # Cluster with most entries
     else:
         center1 = 0
 
     if clusters[index2].nitems > 0:
-        center2 = clusters[index2].sum / clusters[index2].nitems # Cluster mit zweitmeisten Einträgen
+        center2 = clusters[index2].sum / clusters[index2].nitems # Cluster with second most entries
     else:
         center2 = 0
 
     free(clusters)
     return (center1 + center2)/2
+
+cpdef np.ndarray[np.complex64_t, ndim=1] fir_filter(float complex[::1] input_samples, float complex[::1] filter_taps):
+    cdef int i, j
+    cdef int N = len(input_samples)
+    cdef int M = len(filter_taps)
+    cdef np.ndarray[np.complex64_t, ndim=1] output = np.zeros(N+M-1, dtype=np.complex64)
+
+
+    for i in range(N):
+        for j in range(M):
+            output[i+j] += input_samples[i] * filter_taps[j]
+
+
+    return output[:N]
+
+cpdef np.ndarray[np.complex64_t, ndim=1] iir_filter(np.ndarray[np.float64_t, ndim=1] a,
+                                                    np.ndarray[np.float64_t, ndim=1] b,
+                                                    np.ndarray[np.complex64_t, ndim=1] signal):
+    cdef np.ndarray[np.complex64_t, ndim=1] result = np.zeros(len(signal), dtype=np.complex64)
+
+    cdef long n, j, k
+    cdef long M = len(a)
+    cdef long N = len(b)
+    for n in range(max(M, N+1) , len(signal)):
+        for j in range(M):
+            result[n] += a[j] * signal[n-j]
+
+        for k in range(N):
+            result[n] += b[k] * result[n-1-k]
+
+    return result

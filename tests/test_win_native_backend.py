@@ -1,21 +1,30 @@
-import unittest
-
 import sys
+import platform
+
+from tests.QtTestCase import QtTestCase
 
 
-class TestWhitening(unittest.TestCase):
+class TestWinNativeBackend(QtTestCase):
     def test_native_backends_installed(self):
         if sys.platform == "win32":
-            import os
-            cur_dir = os.path.dirname(__file__) if not os.path.islink(__file__) else os.path.dirname(
-                os.readlink(__file__))
-            dll_dir = os.path.realpath(os.path.join(cur_dir, "..", "src", "urh", "dev", "native", "lib", "win"))
-            os.environ['PATH'] = dll_dir + ';' + os.environ['PATH']
+            if platform.architecture()[0] == "64bit":
+                from urh.util import util
 
-            # noinspection PyUnresolvedReferences
-            from urh.dev.native.lib import hackrf
+                util.set_windows_lib_path()
 
-            # noinspection PyUnresolvedReferences
-            from urh.dev.native.RTLSDR import RTLSDR
+                # noinspection PyUnresolvedReferences
+                from urh.dev.native.lib import hackrf
+
+                # noinspection PyUnresolvedReferences
+                from urh.dev.native.lib import rtlsdr
+
+                # noinspection PyUnresolvedReferences
+                from urh.dev.native.lib import airspy
+
+                # noinspection PyUnresolvedReferences
+                from urh.dev.native.lib import limesdr
+
+            else:
+                print("Native Windows device extensions are currently only supported on 64 Bit.")
 
         self.assertTrue(True)

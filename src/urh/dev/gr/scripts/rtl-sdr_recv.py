@@ -6,19 +6,9 @@
 ##################################################
 
 from optparse import OptionParser
+import Initializer
 
-import tempfile
-import os
-import sys
-try:
-    with open(os.path.join(tempfile.gettempdir(), "gnuradio_path.txt"), "r") as f:
-        gnuradio_path = f.read().strip()
-
-    os.environ["PATH"] = os.path.join(gnuradio_path, "bin")
-    sys.path.append(os.path.join(gnuradio_path, "lib", "site-packages"))
-
-except IOError:
-    pass
+Initializer.init_path()
 
 from gnuradio import gr
 from gnuradio.eng_option import eng_option
@@ -28,7 +18,7 @@ import osmosdr
 from gnuradio import zeromq
 
 class top_block(gr.top_block):
-    def __init__(self, samp_rate, freq, gain, bw, port):
+    def __init__(self, samp_rate, freq, gain, bw, freq_correction, direct_sampling, port):
         gr.top_block.__init__(self, "Top Block")
 
         ##################################################
@@ -42,10 +32,10 @@ class top_block(gr.top_block):
         ##################################################
         # Blocks
         ##################################################
-        self.osmosdr_source_0 = osmosdr.source(args="numchan=" + str(1)+ " " + "rtl")
+        self.osmosdr_source_0 = osmosdr.source(args="numchan=" + str(1) + " " + 'direct_samp=' + str(direct_sampling))
         self.osmosdr_source_0.set_sample_rate(samp_rate)
         self.osmosdr_source_0.set_center_freq(freq, 0)
-        self.osmosdr_source_0.set_freq_corr(0, 0)
+        self.osmosdr_source_0.set_freq_corr(freq_correction, 0)
         self.osmosdr_source_0.set_dc_offset_mode(0, 0)
         self.osmosdr_source_0.set_iq_balance_mode(0, 0)
         self.osmosdr_source_0.set_gain_mode(False, 0)
@@ -55,7 +45,7 @@ class top_block(gr.top_block):
         self.osmosdr_source_0.set_antenna("", 0)
         self.osmosdr_source_0.set_bandwidth(bw, 0)
 
-        self.zeromq_push_sink_0 = zeromq.push_sink(gr.sizeof_gr_complex, 1, 'tcp://127.0.0.1:' + str(port), 100, False, -1)
+        self.zeromq_push_sink_0 = zeromq.push_sink(gr.sizeof_gr_complex, 1, 'tcp://127.0.0.1:' + str(port))
 
         ##################################################
         # Connections
@@ -85,6 +75,9 @@ class top_block(gr.top_block):
         self.freq = freq
         self.osmosdr_source_0.set_center_freq(self.freq, 0)
 
+    def set_freq_correction(self, ppm):
+        self.osmosdr_source_0.set_freq_corr(ppm, 0)
+
     def get_bw(self):
         return self.bw
 
@@ -100,9 +93,11 @@ if __name__ == '__main__':
     parser.add_option("-g", "--gain", dest="gain", help="Gain", default=30)
     parser.add_option("-b", "--bandwidth", dest="bw", help="Bandwidth", default=200000)
     parser.add_option("-p", "--port", dest="port", help="Port", default=1337)
+    parser.add_option("-c", "--freq-correction", dest="freq_correction", help="Frequency correction in ppm", default=1)
+    parser.add_option("-d", "--direct-sampling", dest="direct_sampling", help="Direct sampling mode", default=0)
     (options, args) = parser.parse_args()
     tb = top_block(float(options.samplerate), float(options.freq), int(options.gain),
-                   float(options.bw), int(options.port))
+                   float(options.bw), int(options.freq_correction), int(options.direct_sampling), int(options.port))
     iht = InputHandlerThread(tb)
     iht.start()
     tb.start()

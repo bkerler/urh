@@ -1,29 +1,26 @@
 import numpy as np
-from PyQt5.QtCore import pyqtSignal
-from PyQt5.QtCore import pyqtSlot
+from PyQt5.QtCore import pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QMessageBox
 
-from urh.LiveSceneManager import LiveSceneManager
 from urh.controller.SendRecvDialogController import SendRecvDialogController
 from urh.dev.VirtualDevice import Mode, VirtualDevice
+from urh.ui.painting.LiveSceneManager import LiveSceneManager
 from urh.util import FileOperator
 from urh.util.Formatter import Formatter
 
 
 class ReceiveDialogController(SendRecvDialogController):
-    files_recorded = pyqtSignal(list)
+    files_recorded = pyqtSignal(list, float)
 
-    def __init__(self, freq, samp_rate, bw, gain, device: str, parent=None, testing_mode=False):
-        self.is_rx = True
+    def __init__(self, project_manager, parent=None, testing_mode=False):
         try:
-            super().__init__(freq, samp_rate, bw, gain, device, parent=parent, testing_mode=testing_mode)
+            super().__init__(project_manager, is_tx=False, parent=parent, testing_mode=testing_mode)
         except ValueError:
             return
 
-        self.update_interval = 25
-
         self.graphics_view = self.ui.graphicsViewReceive
-        self.ui.stackedWidget.setCurrentIndex(0)
+        self.ui.stackedWidget.setCurrentWidget(self.ui.page_receive)
         self.hide_send_ui_items()
         self.already_saved = True
         self.recorded_files = []
@@ -32,6 +29,10 @@ class ReceiveDialogController(SendRecvDialogController):
         self.scene_manager = None  # type: LiveSceneManager
 
         self.init_device()
+        self.set_bandwidth_status()
+
+        self.setWindowTitle("Record Signal")
+        self.setWindowIcon(QIcon.fromTheme("media-record"))
 
         self.graphics_view.setScene(self.scene_manager.scene)
         self.graphics_view.scene_manager = self.scene_manager
@@ -52,7 +53,12 @@ class ReceiveDialogController(SendRecvDialogController):
             elif reply == QMessageBox.Abort:
                 return False
 
-        self.files_recorded.emit(self.recorded_files)
+        try:
+            sample_rate = self.device.sample_rate
+        except:
+            sample_rate = 1e6
+
+        self.files_recorded.emit(self.recorded_files, sample_rate)
         return True
 
     def update_view(self):
@@ -64,16 +70,9 @@ class ReceiveDialogController(SendRecvDialogController):
 
     def init_device(self):
         device_name = self.ui.cbDevice.currentText()
-        if self.device:
-            self.device.free_data()
-        # Can't perform gc.collect() here, because the dialog itself would be deleted
-        # see https://github.com/jopohl/urh/issues/83
-        # gc.collect()
-        self.device = VirtualDevice(self.backend_handler, device_name, Mode.receive, bw=1e6,
-                                    freq=433.92e6, gain=40, samp_rate=1e6,
+        self.device = VirtualDevice(self.backend_handler, device_name, Mode.receive,
                                     device_ip="192.168.10.2", parent=self)
         self._create_device_connects()
-
         self.scene_manager = LiveSceneManager(np.array([]), parent=self)
 
     @pyqtSlot()
@@ -102,12 +101,14 @@ class ReceiveDialogController(SendRecvDialogController):
 
         dev = self.device
         big_val = Formatter.big_value_with_suffix
-        initial_name = "{0} {1}Hz {2}Sps {3}Hz.complex".format(dev.name, big_val(dev.frequency),
-                                                               big_val(dev.sample_rate),
-                                                               big_val(dev.bandwidth)).replace(
-            Formatter.local_decimal_seperator(), "_").replace("_000", "")
+        initial_name = "{0}-{1}Hz-{2}Sps".format(dev.name, big_val(dev.frequency), big_val(dev.sample_rate))
 
-        filename = FileOperator.save_data_dialog(initial_name, data, parent=self)
+        if dev.bandwidth_is_adjustable:
+            initial_name += "-{}Hz".format(big_val(dev.bandwidth))
+
+        initial_name = initial_name.replace(Formatter.local_decimal_seperator(), "_").replace("_000", "")
+
+        filename = FileOperator.save_data_dialog(initial_name + ".complex", data, parent=self)
         self.already_saved = True
         if filename is not None and filename not in self.recorded_files:
             self.recorded_files.append(filename)

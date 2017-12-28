@@ -5,7 +5,7 @@ import string
 import numpy
 from PyQt5.QtCore import QRegExp
 from PyQt5.QtCore import pyqtSlot, QAbstractTableModel, Qt, QModelIndex, pyqtSignal
-from PyQt5.QtGui import QRegExpValidator
+from PyQt5.QtGui import QRegExpValidator, QCloseEvent
 from PyQt5.QtWidgets import QDialog, QCompleter, QDirModel
 
 from urh import constants
@@ -103,10 +103,10 @@ class ProjectDialogController(QDialog):
         else:
             self.participant_table_model = self.ProtocolParticipantModel(project_manager.participants)
 
-            self.ui.spinBoxSampleRate.setValue(project_manager.sample_rate)
-            self.ui.spinBoxFreq.setValue(project_manager.frequency)
-            self.ui.spinBoxBandwidth.setValue(project_manager.bandwidth)
-            self.ui.spinBoxGain.setValue(project_manager.gain)
+            self.ui.spinBoxSampleRate.setValue(project_manager.device_conf["sample_rate"])
+            self.ui.spinBoxFreq.setValue(project_manager.device_conf["frequency"])
+            self.ui.spinBoxBandwidth.setValue(project_manager.device_conf["bandwidth"])
+            self.ui.spinBoxGain.setValue(project_manager.device_conf["gain"])
             self.ui.txtEdDescription.setPlainText(project_manager.description)
             self.ui.lineEdit_Path.setText(project_manager.project_path)
             self.ui.lineEditBroadcastAddress.setText(project_manager.broadcast_address_hex)
@@ -145,6 +145,10 @@ class ProjectDialogController(QDialog):
         self.ui.lineEdit_Path.setCompleter(completer)
 
         self.create_connects()
+        # add two participants
+        if self.participant_table_model.rowCount() == 0:
+            self.ui.btnAddParticipant.click()
+            self.ui.btnAddParticipant.click()
 
         if new_project:
             self.ui.lineEdit_Path.setText(os.path.realpath(os.path.join(os.curdir, "new")))
@@ -152,6 +156,12 @@ class ProjectDialogController(QDialog):
         self.on_line_edit_path_text_edited()
 
         self.open_editors()
+
+        try:
+            self.restoreGeometry(constants.SETTINGS.value("{}/geometry".format(self.__class__.__name__)))
+        except TypeError:
+            pass
+
 
     def __set_relative_rssi_delegate(self):
         n = len(self.participants)
@@ -212,6 +222,10 @@ class ProjectDialogController(QDialog):
             self.ui.tblParticipants.openPersistentEditor(self.participant_table_model.index(row, 2))
             self.ui.tblParticipants.openPersistentEditor(self.participant_table_model.index(row, 3))
 
+    def closeEvent(self, event: QCloseEvent):
+        constants.SETTINGS.setValue("{}/geometry".format(self.__class__.__name__), self.saveGeometry())
+        super().closeEvent(event)
+
     @pyqtSlot(float)
     def on_spin_box_sample_rate_value_changed(self, value: float):
         self.sample_rate = value
@@ -263,19 +277,17 @@ class ProjectDialogController(QDialog):
         if directory:
             self.set_path(directory)
 
-    @pyqtSlot(str, str, str, str, str)
-    def set_recording_params_from_spectrum_analyzer_link(self, freq: str, sample_rate: str, bw: str, gain: str,
-                                                         dev_name: str):
-        self.ui.spinBoxFreq.setValue(float(freq))
-        self.ui.spinBoxSampleRate.setValue(float(sample_rate))
-        self.ui.spinBoxBandwidth.setValue(float(bw))
-        self.ui.spinBoxGain.setValue(int(gain))
+    @pyqtSlot(str, dict)
+    def set_recording_params_from_spectrum_analyzer_link(self, dev_name, args: dict):
+        self.ui.spinBoxFreq.setValue(args["frequency"])
+        self.ui.spinBoxSampleRate.setValue(args["sample_rate"])
+        self.ui.spinBoxBandwidth.setValue(args["bandwidth"])
+        self.ui.spinBoxGain.setValue(args["gain"])
 
     @pyqtSlot(str)
     def on_spectrum_analyzer_link_activated(self, link: str):
         if link == "open_spectrum_analyzer":
-            r = SpectrumDialogController(freq=self.freq, bw=self.bandwidth, samp_rate=self.sample_rate,
-                                         gain=self.gain, device="", parent=self)
+            r = SpectrumDialogController(ProjectManager(None), parent=self)
             if r.has_empty_device_list:
                 Errors.no_device()
                 r.close()

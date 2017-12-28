@@ -1,147 +1,94 @@
-import time
-from multiprocessing import Process
-from multiprocessing import Queue
-from multiprocessing import Value
-from threading import Thread
+from collections import OrderedDict
 
 import numpy as np
-import sys
 
+from multiprocessing.connection import Connection
 from urh.dev.native.Device import Device
-from urh.dev.native.lib import rtlsdr
+
+try:
+    from urh.dev.native.lib import rtlsdr
+except ImportError:
+    import urh.dev.native.lib.rtlsdr_fallback as rtlsdr
 from urh.util.Logger import logger
 
 
-def receive_sync(rcv_queue: Queue, is_receiving_p: Value, sample_rate):
-    while is_receiving_p.value == 1:
-        read_samples = 1024
-        stuff = rtlsdr.read_sync(read_samples)
-        rcv_queue.put(stuff)
-        time.sleep(read_samples / sample_rate)
-    return True
-
-
 class RTLSDR(Device):
-    BYTES_PER_SAMPLE = 2  # RTLSDR device produces 8 bit unsigned IQ data
+    DEVICE_LIB = rtlsdr
+    ASYNCHRONOUS = False
+    DEVICE_METHODS = Device.DEVICE_METHODS.copy()
+    DEVICE_METHODS.update({
+        Device.Command.SET_RF_GAIN.name: "set_tuner_gain",
+        Device.Command.SET_BANDWIDTH.name: "set_tuner_bandwidth",
+        Device.Command.SET_FREQUENCY_CORRECTION.name: "set_freq_correction",
+        Device.Command.SET_DIRECT_SAMPLING_MODE.name: "set_direct_sampling"
+    })
 
-    def __init__(self, freq, gain, srate, device_number, is_ringbuffer=False):
-        super().__init__(0, freq, gain, srate, is_ringbuffer)
+    @classmethod
+    def setup_device(cls, ctrl_connection: Connection, device_identifier):
+        # identifier gets set in self.receive_process_arguments
+        device_number = int(device_identifier)
+        ret = rtlsdr.open(device_number)
+        ctrl_connection.send("OPEN:" + str(ret))
+        return ret == 0
+
+    @classmethod
+    def prepare_sync_receive(cls, ctrl_connection: Connection):
+        ret = rtlsdr.reset_buffer()
+        ctrl_connection.send("RESET_BUFFER:" + str(ret))
+        return ret == 0
+
+    @classmethod
+    def receive_sync(cls, data_conn: Connection):
+        data_conn.send_bytes(rtlsdr.read_sync())
+
+    @classmethod
+    def shutdown_device(cls, ctrl_connection, is_tx: bool):
+        logger.debug("RTLSDR: closing device")
+        ret = rtlsdr.close()
+        ctrl_connection.send("CLOSE:" + str(ret))
+
+    def __init__(self, freq, gain, srate, device_number, resume_on_full_receive_buffer=False):
+        super().__init__(center_freq=freq, sample_rate=srate, bandwidth=0,
+                         gain=gain, if_gain=1, baseband_gain=1,
+                         resume_on_full_receive_buffer=resume_on_full_receive_buffer)
 
         self.success = 0
-
-        self.is_receiving_p = Value('i', 0)
-        """
-        Shared Value to communicate with the receiving process.
-
-        """
-
-        self.bandwidth_is_adjustable = False
-        self._max_frequency = 6e9
-        self._max_sample_rate = 3200000
-        self._max_frequency = 6e9
-        self._max_gain = 40  # Consider get_tuner_gains for allowed gains here
+        self.bandwidth_is_adjustable = self.get_bandwidth_is_adjustable()  # e.g. not in Manjaro Linux / Ubuntu 14.04
 
         self.device_number = device_number
 
-    def open(self):
-        if not self.is_open:
-            ret = rtlsdr.open(self.device_number)
-            self.log_retcode(ret, "open")
+    @staticmethod
+    def get_bandwidth_is_adjustable():
+        return hasattr(rtlsdr, "set_tuner_bandwidth")
 
-            ret = rtlsdr.reset_buffer()
-            self.log_retcode(ret, "reset_buffer")
+    @property
+    def device_parameters(self):
+        return OrderedDict([(self.Command.SET_FREQUENCY.name, self.frequency),
+                            (self.Command.SET_SAMPLE_RATE.name, self.sample_rate),
+                            (self.Command.SET_BANDWIDTH.name, self.bandwidth),
+                            (self.Command.SET_FREQUENCY_CORRECTION.name, self.freq_correction),
+                            (self.Command.SET_DIRECT_SAMPLING_MODE.name, self.direct_sampling_mode),
+                            (self.Command.SET_RF_GAIN.name, 10 * self.gain),
+                            ("identifier", self.device_number)])
 
-            self.is_open = ret == self.success
-            self.log_retcode(ret, "open")
-
-    def close(self):
-        rtlsdr.close()
-
-    def start_rx_mode(self):
-        if self.is_open:
-            self.init_recv_buffer()
-            self.set_device_parameters()
-
-            self.is_receiving = True
-
-            self.is_receiving_p = Value('i', 1)
-            if sys.platform == "win32":
-                # Windows is not able to share resources between processes, so process would have to access to rtlsdr
-                # see: http://rhodesmill.org/brandon/2010/python-multiprocessing-linux-windows/
-                self.receive_process = Thread(target=receive_sync, args=(self.queue, self.is_receiving_p, self.sample_rate))
-            else:
-                self.receive_process = Process(target=receive_sync, args=(self.queue, self.is_receiving_p, self.sample_rate))
-            self.receive_process.daemon = True
-            self.receive_process.start()
-
-            if self.is_receiving:
-                logger.info("RTLSDR: Starting receiving thread")
-                self._start_readqueue_thread()
-
+    def set_device_bandwidth(self, bandwidth):
+        if self.bandwidth_is_adjustable:
+            super().set_device_bandwidth(bandwidth)
         else:
-            self.log_retcode(self.error_not_open, "start_rx_mode")
-
-    def stop_rx_mode(self, msg):
-        self.is_receiving = False
-        self.is_receiving_p.value = 0
-
-        logger.info("RTLSDR: Stopping RX Mode: " + msg)
-
-        if hasattr(self, "read_queue_thread") and self.read_queue_thread.is_alive():
-            try:
-                self.read_queue_thread.join(0.001)
-                logger.info("RTLSDR: Joined read_queue_thread")
-            except RuntimeError:
-                logger.error("RTLSDR: Could not join read_queue_thread")
-
-        if hasattr(self, "receive_process") and self.receive_process.is_alive():
-            if self.receive_process.is_alive():
-                self.receive_process.join()
-                if not self.receive_process.is_alive():
-                    logger.info("RTLSDR: Terminated async read process")
-                else:
-                    logger.warning("RTLSDR: Could not terminate async read process")
-
-    def set_device_frequency(self, frequency):
-        ret = rtlsdr.set_center_freq(int(frequency))
-        self.log_retcode(ret, "Set center freq")
-
-    def set_device_sample_rate(self, sample_rate):
-        ret = rtlsdr.set_sample_rate(int(sample_rate))
-        self.log_retcode(ret, "Set sample rate")
-
-    def set_freq_correction(self, ppm):
-        ret = rtlsdr.set_freq_correction(int(ppm))
-        self.log_retcode(ret, "Set frequency correction")
-
-    def set_offset_tuning(self, on: bool):
-        ret = rtlsdr.set_offset_tuning(on)
-        self.log_retcode(ret, "Set offset tuning")
-
-    def set_gain_mode(self, manual: bool):
-        ret = rtlsdr.set_tuner_gain_mode(manual)
-        self.log_retcode(ret, "Set gain mode manual")
-
-    def set_if_gain(self, gain):
-        ret = rtlsdr.set_tuner_if_gain(1, int(gain))
-        self.log_retcode(ret, "Set IF gain")
-
-    def set_gain(self, gain):
-        ret = rtlsdr.set_tuner_gain(int(gain))
-        self.log_retcode(ret, "Set gain")
+            logger.warning("Setting the bandwidth is not supported by your RTL-SDR driver version.")
 
     def set_device_gain(self, gain):
-        self.set_gain(gain)
+        super().set_device_gain(10 * gain)
 
     @staticmethod
-    def unpack_complex(buffer, nvalues: int):
+    def unpack_complex(buffer):
         """
         The raw, captured IQ data is 8 bit unsigned data.
 
         :return:
         """
-        result = np.empty(nvalues, dtype=np.complex64)
         unpacked = np.frombuffer(buffer, dtype=[('r', np.uint8), ('i', np.uint8)])
+        result = np.empty(len(unpacked), dtype=np.complex64)
         result.real = (unpacked['r'] / 127.5) - 1.0
         result.imag = (unpacked['i'] / 127.5) - 1.0
         return result

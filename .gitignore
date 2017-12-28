@@ -16,11 +16,10 @@ src/urh/controller/__pycache__/
 src/urh/cythonext/__pycache__/
 src/urh/dev/__pycache__/
 src/urh/dev/gr/__pycache__/
-src/urh/dev/gr/scripts/InputHandlerThread.pyc
+*.pyc
 src/urh/dev/native/__pycache__/
 src/urh/dev/native/lib/__pycache__/
 src/urh/models/__pycache__/
-src/urh/plugins/AmbleAnalyzer/__pycache__/
 src/urh/plugins/MessageBreak/__pycache__/
 src/urh/plugins/ZeroHide/__pycache__/
 src/urh/plugins/__pycache__/
@@ -36,3 +35,6 @@ src/urh.egg-info/
 .cache/
 tests/data/URHProject.xml
 src/urh/cythonext/*.html
+/tests/show_gui
+
+misc/*

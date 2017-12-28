@@ -1,7 +1,4 @@
 import locale
-
-
-# locale.setlocale(locale.LC_ALL, '')
 from urh.util.Logger import logger
 
 
@@ -41,7 +38,7 @@ class Formatter:
         elif abs(value) >= 1e6:
             return locale.format_string(fmt_str+"M", value / 1e6)
         elif abs(value) >= 1e3:
-            return locale.format_string(fmt_str+"K", value / 1e3)
+            return locale.format_string(fmt_str+"k", value / 1e3)
         else:
             return locale.format_string(fmt_str, value)
 

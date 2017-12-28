@@ -1,7 +1,7 @@
 # cython wrapper for RTL-SDR (https://github.com/pinkavaj/rtl-sdr)
 
 cimport crtlsdr
-from libc.stdlib cimport malloc
+from libc.stdlib cimport malloc, free
 
 ctypedef unsigned char uint8_t
 ctypedef unsigned short uint16_t
@@ -12,7 +12,9 @@ cdef crtlsdr.rtlsdr_dev_t*_c_device
 
 cdef void _c_callback_recv(unsigned char *buffer, uint32_t length, void *ctx):
     global f
+    conn = <object> ctx
     (<object>f)(buffer[0:length])
+
 
 cpdef uint32_t get_device_count():
     return crtlsdr.rtlsdr_get_device_count()
@@ -194,6 +196,15 @@ cpdef int set_tuner_gain_mode(int manual):
     """
     return crtlsdr.rtlsdr_set_tuner_gain_mode(_c_device, manual)
 
+cpdef int set_tuner_bandwidth(uint32_t bw):
+    """
+    Set the bandwidth for the device.
+
+    :param bw: bandwidth in Hz. Zero means automatic BW selection.
+    :return 0 on success
+    """
+    crtlsdr.rtlsdr_set_tuner_bandwidth(_c_device, bw)
+
 cpdef int set_sample_rate(uint32_t sample_rate):
     """
     Set the sample rate for the device, also selects the baseband filters
@@ -271,13 +282,17 @@ cpdef bytes read_sync(int num_samples=8 * 32 * 512):
     :return:
     """
     cdef uint8_t *samples = <uint8_t *> malloc(2*num_samples * sizeof(uint8_t))
+    if not samples:
+        raise MemoryError()
+
     cdef int n_read = 0
+    try:
+        crtlsdr.rtlsdr_read_sync(_c_device, <void *>samples, num_samples, &n_read)
+        return bytes(samples[0:n_read])
+    finally:
+        free(samples)
 
-    crtlsdr.rtlsdr_read_sync(_c_device, <void *>samples, num_samples, &n_read)
-
-    return bytes(samples[0:n_read])
-
-cpdef int read_async(callback):
+cpdef int read_async(callback, connection):
     """
     Read samples from the device asynchronously. This function will block until
     it is being canceled using rtlsdr_cancel_async()
@@ -286,7 +301,7 @@ cpdef int read_async(callback):
     """
     global f
     f = callback
-    return crtlsdr.rtlsdr_read_async(_c_device, _c_callback_recv, <void *>0, 0, 0)
+    return crtlsdr.rtlsdr_read_async(_c_device, _c_callback_recv, <void *>connection, 0, 0)
 
 cpdef int cancel_async():
     """

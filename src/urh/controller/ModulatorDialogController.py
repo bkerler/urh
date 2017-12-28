@@ -1,8 +1,9 @@
 import numpy
 from PyQt5.QtCore import Qt, pyqtSlot
-from PyQt5.QtGui import QResizeEvent, QKeyEvent
+from PyQt5.QtGui import QCloseEvent, QResizeEvent, QKeyEvent
 from PyQt5.QtWidgets import QDialog, QMessageBox
 
+from urh import constants
 from urh.signalprocessing.Modulator import Modulator
 from urh.signalprocessing.ProtocolAnalyzer import ProtocolAnalyzer
 from urh.ui.ui_modulation import Ui_DialogModulation
@@ -28,6 +29,11 @@ class ModulatorDialogController(QDialog):
 
         self.modulators = modulators
 
+        for graphic_view in (self.ui.gVCarrier, self.ui.gVData, self.ui.gVModulated):
+            graphic_view.scene_y_min = -1
+            graphic_view.scene_y_max = 1
+            graphic_view.scene_x_zoom_stretch = 1.1
+
         self.set_ui_for_current_modulator()
 
         self.ui.cbShowDataBitsOnly.setText(self.tr("Show Only Data Sequence\n"))
@@ -40,11 +46,17 @@ class ModulatorDialogController(QDialog):
 
         self.ui.chkBoxLockSIV.setDisabled(True)
 
-        self.create_connects()
-        self.on_modulation_type_changed()
-
         self.original_bits = ""
         self.ui.btnRestoreBits.setEnabled(False)
+
+        self.create_connects()
+
+        try:
+            self.restoreGeometry(constants.SETTINGS.value("{}/geometry".format(self.__class__.__name__)))
+        except TypeError:
+            pass
+
+        self.set_modulation_profile_status()
 
     def __cur_selected_mod_type(self):
         s = self.ui.comboBoxModulationType.currentText()
@@ -81,6 +93,15 @@ class ModulatorDialogController(QDialog):
         self.ui.spinBoxGaussFilterWidth.setValue(self.current_modulator.gauss_filter_width)
         self.ui.spinBoxGaussBT.setValue(self.current_modulator.gauss_bt)
 
+    def closeEvent(self, event: QCloseEvent):
+        constants.SETTINGS.setValue("{}/geometry".format(self.__class__.__name__), self.saveGeometry())
+
+        for gv in (self.ui.gVCarrier, self.ui.gVData, self.ui.gVModulated, self.ui.gVOriginalSignal):
+            # Eliminate graphic views to prevent segfaults
+            gv.eliminate()
+
+        super().closeEvent(event)
+
     @property
     def current_modulator(self):
         mod = self.modulators[self.ui.comboBoxCustomModulations.currentIndex()]
@@ -98,13 +119,13 @@ class ModulatorDialogController(QDialog):
         self.ui.spinBoxParameter1.setValue(self.current_modulator.param_for_one)
 
     def create_connects(self):
-        self.ui.doubleSpinBoxCarrierFreq.editingFinished.connect(self.on_carrier_freq_changed)
-        self.ui.doubleSpinBoxCarrierPhase.editingFinished.connect(self.on_carrier_phase_changed)
-        self.ui.spinBoxBitLength.editingFinished.connect(self.on_bit_len_changed)
-        self.ui.spinBoxSampleRate.editingFinished.connect(self.on_sample_rate_changed)
+        self.ui.doubleSpinBoxCarrierFreq.valueChanged.connect(self.on_carrier_freq_changed)
+        self.ui.doubleSpinBoxCarrierPhase.valueChanged.connect(self.on_carrier_phase_changed)
+        self.ui.spinBoxBitLength.valueChanged.connect(self.on_bit_len_changed)
+        self.ui.spinBoxSampleRate.valueChanged.connect(self.on_sample_rate_changed)
         self.ui.linEdDataBits.textChanged.connect(self.on_data_bits_changed)
-        self.ui.spinBoxParameter0.editingFinished.connect(self.on_modulation_parameter_zero_changed)
-        self.ui.spinBoxParameter1.editingFinished.connect(self.on_modulation_parameter_one_changed)
+        self.ui.spinBoxParameter0.valueChanged.connect(self.on_modulation_parameter_zero_changed)
+        self.ui.spinBoxParameter1.valueChanged.connect(self.on_modulation_parameter_one_changed)
         self.ui.comboBoxModulationType.currentIndexChanged.connect(self.on_modulation_type_changed)
         self.ui.gVOriginalSignal.zoomed.connect(self.on_orig_signal_zoomed)
         self.ui.cbShowDataBitsOnly.stateChanged.connect(self.on_show_data_bits_only_changed)
@@ -117,10 +138,10 @@ class ModulatorDialogController(QDialog):
         self.ui.gVModulated.zoomed.connect(self.on_carrier_data_modulated_zoomed)
         self.ui.gVCarrier.zoomed.connect(self.on_carrier_data_modulated_zoomed)
         self.ui.gVData.zoomed.connect(self.on_carrier_data_modulated_zoomed)
-        self.ui.gVModulated.sel_area_width_changed.connect(self.on_modulated_selection_changed)
-        self.ui.gVOriginalSignal.sel_area_width_changed.connect(self.on_original_selection_changed)
-        self.ui.spinBoxGaussBT.editingFinished.connect(self.on_gauss_bt_edited)
-        self.ui.spinBoxGaussFilterWidth.editingFinished.connect(self.on_gaus_filter_wdith_edited)
+        self.ui.gVModulated.selection_width_changed.connect(self.on_modulated_selection_changed)
+        self.ui.gVOriginalSignal.selection_width_changed.connect(self.on_original_selection_changed)
+        self.ui.spinBoxGaussBT.valueChanged.connect(self.on_gauss_bt_changed)
+        self.ui.spinBoxGaussFilterWidth.valueChanged.connect(self.on_gaus_filter_wdith_changed)
 
         self.ui.chkBoxLockSIV.stateChanged.connect(self.on_lock_siv_changed)
         self.ui.btnRestoreBits.clicked.connect(self.on_btn_restore_bits_clicked)
@@ -244,15 +265,16 @@ class ModulatorDialogController(QDialog):
             one_freq = self.__trim_number(one_freq)
             zero_freq, one_freq = self.__ensure_multitude(zero_freq, one_freq)
 
+            if zero_freq == one_freq:
+                # If frequencies are equal, it is very probable the zero freq is negative
+                zero_freq = -one_freq
+
             self.ui.spinBoxParameter0.setValue(zero_freq)
             self.ui.spinBoxParameter1.setValue(one_freq)
 
         except AttributeError:
             self.ui.spinBoxParameter0.setValue(self.current_modulator.carrier_freq_hz / 2)
             self.ui.spinBoxParameter1.setValue(self.current_modulator.carrier_freq_hz)
-
-        self.ui.spinBoxParameter0.editingFinished.emit()
-        self.ui.spinBoxParameter1.editingFinished.emit()
 
     def handle_signal_loaded(self, protocol):
         self.setCursor(Qt.WaitCursor)
@@ -263,7 +285,6 @@ class ModulatorDialogController(QDialog):
 
         # Apply bit length of original signal to current modulator
         self.ui.spinBoxBitLength.setValue(self.ui.gVOriginalSignal.signal.bit_len)
-        self.ui.spinBoxBitLength.editingFinished.emit()
 
         # https://github.com/jopohl/urh/issues/130
         self.ui.gVModulated.show_full_scene(reinitialize=True)
@@ -274,10 +295,12 @@ class ModulatorDialogController(QDialog):
 
     def mark_samples_in_view(self):
         self.ui.lSamplesInViewModulated.setText(str(int(self.ui.gVModulated.view_rect().width())))
+
         if self.ui.gVOriginalSignal.scene_manager is not None:
             self.ui.lSamplesInViewOrigSignal.setText(str(int(self.ui.gVOriginalSignal.view_rect().width())))
         else:
             self.ui.lSamplesInViewOrigSignal.setText("-")
+            return
 
         if int(self.ui.gVOriginalSignal.view_rect().width()) != int(self.ui.gVModulated.view_rect().width()):
             font = self.ui.lSamplesInViewModulated.font()
@@ -295,6 +318,12 @@ class ModulatorDialogController(QDialog):
 
             self.ui.lSamplesInViewOrigSignal.setStyleSheet("")
             self.ui.lSamplesInViewModulated.setStyleSheet("")
+
+    def set_modulation_profile_status(self):
+        visible = constants.SETTINGS.value("multiple_modulations", False, bool)
+        self.ui.btnAddModulation.setVisible(visible)
+        self.ui.btnRemoveModulation.setVisible(visible)
+        self.ui.comboBoxCustomModulations.setVisible(visible)
 
     def resizeEvent(self, event: QResizeEvent):
         self.update_views()
@@ -324,6 +353,9 @@ class ModulatorDialogController(QDialog):
         self.draw_data_bits()
         self.draw_modulated()
 
+        for graphic_view in (self.ui.gVModulated, self.ui.gVData, self.ui.gVCarrier):
+            graphic_view.show_full_scene(reinitialize=True)
+
     @pyqtSlot()
     def on_data_bits_changed(self):
         text = self.ui.linEdDataBits.text()
@@ -336,8 +368,14 @@ class ModulatorDialogController(QDialog):
         self.draw_data_bits()
         self.draw_modulated()
         if len(text) > 0:
-            self.ui.cbShowDataBitsOnly.setText(self.tr("Show Only Data Sequence\n") + "(" + text + ")")
+            if len(text) > 24:
+                display_text = text[0:24] + "..."
+            else:
+                display_text = text
+            self.ui.cbShowDataBitsOnly.setToolTip(text)
+            self.ui.cbShowDataBitsOnly.setText(self.tr("Show Only Data Sequence\n") + "(" + display_text + ")")
         else:
+            self.ui.cbShowDataBitsOnly.setToolTip("")
             self.ui.cbShowDataBitsOnly.setText(self.tr("Show Only Data Sequence\n"))
 
         self.search_data_sequence()
@@ -346,6 +384,9 @@ class ModulatorDialogController(QDialog):
             self.ui.btnRestoreBits.setDisabled(True)
         else:
             self.ui.btnRestoreBits.setEnabled(True)
+
+        for graphic_view in (self.ui.gVModulated, self.ui.gVData, self.ui.gVCarrier):
+            graphic_view.show_full_scene(reinitialize=True)
 
     @pyqtSlot()
     def on_sample_rate_changed(self):
@@ -365,12 +406,12 @@ class ModulatorDialogController(QDialog):
         self.draw_modulated()
 
     @pyqtSlot()
-    def on_gauss_bt_edited(self):
+    def on_gauss_bt_changed(self):
         self.current_modulator.gauss_bt = self.ui.spinBoxGaussBT.value()
         self.draw_modulated()
 
     @pyqtSlot()
-    def on_gaus_filter_wdith_edited(self):
+    def on_gaus_filter_wdith_changed(self):
         self.current_modulator.gauss_filter_width = self.ui.spinBoxGaussFilterWidth.value()
         self.draw_modulated()
 
@@ -387,8 +428,6 @@ class ModulatorDialogController(QDialog):
         if self.__cur_selected_mod_type() == "ASK":
             self.ui.lParameterfor0.setText(self.tr("Amplitude for 0:"))
             self.ui.lParameterfor1.setText(self.tr("Amplitude for 1:"))
-            self.ui.spinBoxParameter0.auto_suffix = False
-            self.ui.spinBoxParameter1.auto_suffix = False
             self.ui.spinBoxParameter0.setMaximum(100)
             self.ui.spinBoxParameter0.setMinimum(0)
             self.ui.spinBoxParameter0.setDecimals(0)
@@ -405,8 +444,8 @@ class ModulatorDialogController(QDialog):
                 self.ui.spinBoxParameter1.setValue(self.current_modulator.param_for_one)
 
         elif self.__cur_selected_mod_type() in ("FSK", "GFSK"):
-            self.ui.spinBoxParameter0.auto_suffix = True
-            self.ui.spinBoxParameter1.auto_suffix = True
+            self.ui.spinBoxParameter0.setSuffix("")
+            self.ui.spinBoxParameter1.setSuffix("")
             self.ui.lParameterfor0.setText(self.tr("Frequency for 0:"))
             self.ui.lParameterfor1.setText(self.tr("Frequency for 1:"))
             self.ui.spinBoxParameter0.setMaximum(1e12)
@@ -422,8 +461,6 @@ class ModulatorDialogController(QDialog):
                 self.ui.spinBoxParameter1.setValue(self.current_modulator.param_for_one)
 
         elif self.__cur_selected_mod_type() == "PSK":
-            self.ui.spinBoxParameter0.auto_suffix = False
-            self.ui.spinBoxParameter1.auto_suffix = False
             self.ui.lParameterfor0.setText(self.tr("Phase (degree) for 0:"))
             self.ui.lParameterfor1.setText(self.tr("Phase (degree) for 1:"))
             self.ui.spinBoxParameter0.setMaximum(360)
@@ -440,9 +477,6 @@ class ModulatorDialogController(QDialog):
             else:
                 self.ui.spinBoxParameter0.setValue(self.current_modulator.param_for_zero)
                 self.ui.spinBoxParameter1.setValue(self.current_modulator.param_for_one)
-
-        self.ui.spinBoxParameter0.editingFinished.emit()
-        self.ui.spinBoxParameter1.editingFinished.emit()
 
     @pyqtSlot()
     def on_orig_signal_zoomed(self):
@@ -470,8 +504,11 @@ class ModulatorDialogController(QDialog):
         for gv in (self.ui.gVCarrier, self.ui.gVData, self.ui.gVModulated):
             if gv == self.sender():
                 continue
-            gv.scale(factor, 1)
-            gv.centerOn(x, y)
+            if factor == -1:
+                gv.show_full_scene()
+            else:
+                gv.scale(factor, 1)
+                gv.centerOn(x, y)
 
         if self.lock_samples_in_view:
             self.adjust_samples_in_view(self.ui.gVModulated.view_rect().width())
@@ -538,29 +575,15 @@ class ModulatorDialogController(QDialog):
 
     @pyqtSlot()
     def on_btn_autodetect_clicked(self):
-        proto_bits = self.protocol.plain_bits_str
+        signal = self.ui.gVOriginalSignal.scene_manager.signal
+        freq = self.current_modulator.estimate_carrier_frequency(signal, self.protocol)
 
-        message_index = -1
-        pos = -1
-
-        # Lets find a one
-        for i, message in enumerate(proto_bits):
-            j = message.find("1")
-            if j != -1:
-                message_index = i
-                pos = j
-                break
-
-        if message_index == -1 or pos == -1:
+        if freq is None or freq == 0:
             QMessageBox.information(self, self.tr("No results"),
                                     self.tr("Unable to detect parameters from current signal"))
             return
 
-        start, nsamples = self.protocol.get_samplepos_of_bitseq(message_index, pos, message_index, pos + 1, False)
-        signal = self.ui.gVOriginalSignal.scene_manager.signal
-        freq = signal.estimate_frequency(start, start + nsamples, self.current_modulator.sample_rate)
         self.ui.doubleSpinBoxCarrierFreq.setValue(freq)
-        self.ui.doubleSpinBoxCarrierFreq.editingFinished.emit()
         self.autodetect_fsk_freqs()
 
     @pyqtSlot(int)

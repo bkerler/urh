@@ -1,9 +1,10 @@
+import sys
 from PyQt5.QtCore import QModelIndex, Qt, QAbstractItemModel, pyqtSlot
-from PyQt5.QtGui import QImage, QPainter, QColor, QPixmap
-from PyQt5.QtWidgets import QItemDelegate, QWidget, QStyleOptionViewItem, QComboBox
+from PyQt5.QtGui import QImage, QPainter, QColor, QPixmap, QFontMetrics
+from PyQt5.QtWidgets import QStyledItemDelegate, QWidget, QStyleOptionViewItem, QComboBox
 
 
-class ComboBoxDelegate(QItemDelegate):
+class ComboBoxDelegate(QStyledItemDelegate):
     def __init__(self, items, colors=None, is_editable=False, return_index=True, parent=None):
         """
 
@@ -18,16 +19,25 @@ class ComboBoxDelegate(QItemDelegate):
         self.colors = colors
         self.return_index = return_index
         self.is_editable = is_editable
+        self.current_edit_text = ""
+
         if colors:
             assert len(items) == len(colors)
 
     def createEditor(self, parent: QWidget, option: QStyleOptionViewItem, index: QModelIndex):
         editor = QComboBox(parent)
+        if sys.platform == "win32":
+            # Ensure text entries are visible with windows combo boxes
+            editor.setMinimumHeight(self.sizeHint(option, index).height() + 10)
+
         editor.addItems(self.items)
 
         if self.is_editable:
             editor.setEditable(True)
             editor.setInsertPolicy(QComboBox.NoInsert)
+
+        if self.current_edit_text:
+            editor.setEditText(self.current_edit_text)
 
         if self.colors:
             img = QImage(16, 16, QImage.Format_RGB32)
@@ -42,6 +52,7 @@ class ComboBoxDelegate(QItemDelegate):
 
             del painter
         editor.currentIndexChanged.connect(self.currentIndexChanged)
+        editor.editTextChanged.connect(self.on_edit_text_changed)
         return editor
 
     def setEditorData(self, editor: QWidget, index: QModelIndex):
@@ -60,6 +71,13 @@ class ComboBoxDelegate(QItemDelegate):
         else:
             model.setData(index, editor.currentText(), Qt.EditRole)
 
+    def updateEditorGeometry(self, editor: QWidget, option: QStyleOptionViewItem, index: QModelIndex):
+        editor.setGeometry(option.rect)
+
     @pyqtSlot()
     def currentIndexChanged(self):
         self.commitData.emit(self.sender())
+
+    @pyqtSlot(str)
+    def on_edit_text_changed(self, text: str):
+        self.current_edit_text = text

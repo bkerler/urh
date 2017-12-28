@@ -1,4 +1,5 @@
 import locale
+import xml.etree.ElementTree as ET
 
 import numpy as np
 from PyQt5.QtCore import Qt
@@ -7,11 +8,8 @@ from PyQt5.QtWidgets import QGraphicsScene
 
 from urh import constants
 from urh.cythonext import path_creator
-from urh.cythonext.signalFunctions import Symbol
-from urh.ui.ZoomableScene import ZoomableScene
+from urh.ui.painting.ZoomableScene import ZoomableScene
 from urh.util.Formatter import Formatter
-
-import xml.etree.ElementTree as ET
 
 
 class Modulator(object):
@@ -148,7 +146,7 @@ class Modulator(object):
             self.data = data
 
         mod_type = self.MODULATION_TYPES[self.modulation_type]
-        total_samples = int(sum(bit.nsamples if type(bit) == Symbol else self.samples_per_bit for bit in data) + pause)
+        total_samples = int(len(data) * self.samples_per_bit + pause)
 
         self.modulated_samples = np.zeros(total_samples, dtype=np.complex64)
 
@@ -157,12 +155,8 @@ class Modulator(object):
         sample_pos = 0
 
         for i, bit in enumerate(data):
-            if type(bit) == Symbol:
-                samples_per_bit = int(bit.nsamples)
-                log_bit = True if bit.pulsetype == 1 else False
-            else:
-                log_bit = bit
-                samples_per_bit = int(self.samples_per_bit)
+            log_bit = bit
+            samples_per_bit = int(self.samples_per_bit)
 
             if mod_type == "FSK" or mod_type == "GFSK":
                 param = 1 if log_bit else -1
@@ -196,8 +190,13 @@ class Modulator(object):
         else:
             f = self.carrier_freq_hz
 
-        arg = ((2 * np.pi * f * t + phi) * 1j).astype(np.complex64)
-        self.modulated_samples[:total_samples - pause] = a * np.exp(arg)
+        # it may be tempting to do this with complex exp, but exp overflows for large values!
+        # arg = ((2 * np.pi * f * t + phi) * 1j).astype(np.complex64)
+        # self.modulated_samples[:total_samples - pause] = a * np.exp(arg)
+
+        arg = (2 * np.pi * f * t + phi)
+        self.modulated_samples[:total_samples - pause].real = a * np.cos(arg)
+        self.modulated_samples[:total_samples - pause].imag = a * np.sin(arg)
 
     def gauss_fir(self, bt=0.5, filter_width=1):
         """
@@ -226,6 +225,18 @@ class Modulator(object):
         root.set("index", str(index))
 
         return root
+
+    def estimate_carrier_frequency(self, signal, protocol) -> int or None:
+        if len(protocol.messages) == 0:
+            return None
+
+        # Take the first message for detection
+        start, num_samples = protocol.get_samplepos_of_bitseq(0, 0, 0, 999999, False)
+        # Avoid too large arrays
+        if num_samples > 1e6:
+            num_samples = int(1e6)
+
+        return signal.estimate_frequency(start, start + num_samples, self.sample_rate)
 
     @staticmethod
     def from_xml(tag: ET.Element):

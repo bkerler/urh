@@ -19,7 +19,10 @@ class VMHelper(object):
     def start_vm(self):
         call('VBoxManage startvm "{0}"'.format(self.vm_name), shell=True)
 
-    def stop_vm(self):
+    def stop_vm(self, save=True):
+        if save:
+            call('VBoxManage controlvm "{0}" savestate'.format(self.vm_name), shell=True)
+            return
         if self.use_ssh:
             self.send_command("sudo shutdown -h now")
         else:
@@ -28,8 +31,12 @@ class VMHelper(object):
     def wait_for_vm_up(self):
         if not self.__vm_is_up:
             print("Waiting for {} to come up.".format(self.vm_name))
-            while self.__send_command("echo", hide_output=True, print_command=False) != 0:
+            command = "ping -c 1" if self.use_ssh else "ping -n 1"
+            command += " github.com"
+
+            while self.__send_command(command, hide_output=True, print_command=False) != 0:
                 time.sleep(1)
+
             self.__vm_is_up = True
 
     def send_command(self, command: str) -> int:
@@ -97,6 +104,7 @@ class TestInstallation(unittest.TestCase):
         target_dir = r"C:\urh"
         vm_helper = VMHelper("Windows 10", shell="cmd.exe /c")
         vm_helper.start_vm()
+        vm_helper.send_command("pip uninstall urh")
         vm_helper.send_command("rd /s /q {0}".format(target_dir))
         vm_helper.send_command("git clone https://github.com/jopohl/urh " + target_dir)
         rc = vm_helper.send_command(r"python C:\urh\src\urh\cythonext\build.py")
@@ -106,6 +114,7 @@ class TestInstallation(unittest.TestCase):
         self.assertEqual(rc, 0)
 
         vm_helper.send_command("pip install urh")
+        time.sleep(0.5)
         rc = vm_helper.send_command("urh autoclose")
         self.assertEqual(rc, 0)
         vm_helper.send_command("pip uninstall urh")
